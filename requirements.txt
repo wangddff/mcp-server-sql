@@ -1,0 +1,9 @@
+
+#### 📄 `requirements.txt`
+#### ubuntu os needs apt-get install postgresql & libpq-dev first
+
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+psycopg2-binary==2.9.9
+PyMySQL==1.1.1
+python-dotenv==1.0.1
