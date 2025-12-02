@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # ======================
+  # PostgreSQL 数据库（带示例数据）
+  # ======================
+  postgres-db:
+    image: postgres:16
+    container_name: mcp-postgres
+    environment:
+      POSTGRES_DB: demo_db
+      POSTGRES_USER: demo_user
+      POSTGRES_PASSWORD: demo_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-postgres:/docker-entrypoint-initdb.d
+    networks:
+      - mcp-network
+
+  # ======================
+  # MySQL 数据库（带示例数据）
+  # ======================
+  mysql-db:
+    image: mysql:8.0
+    container_name: mcp-mysql
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_DATABASE: demo_db
+      MYSQL_USER: demo_user
+      MYSQL_PASSWORD: demo_pass
+      MYSQL_ROOT_PASSWORD: root_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./init-mysql:/docker-entrypoint-initdb.d
+    networks:
+      - mcp-network
+
+  # ======================
+  # MCP Server（默认连接 PostgreSQL）
+  # ======================
+  mcp-server:
+    build: mcp/.
+    container_name: mcp-server
+    ports:
+      - "8080:8000"
+    environment:
+      # 切换数据库：注释一个，取消注释另一个
+      DATABASE_URL: "postgresql://demo_user:demo_pass@postgres-db:5432/demo_db"
+      DB_TYPE: "postgresql"
+      # DATABASE_URL: "mysql://demo_user:demo_pass@mysql-db:3306/demo_db"
+      # DB_TYPE: "mysql"
+      MCP_API_KEY: "your-secret-api-key"  # 可选，用于 Dify 认证
+    depends_on:
+      - postgres-db
+      # - mysql-db   # 如果用 MySQL，取消注释此行并注释 postgres-db
+    networks:
+      - mcp-network
+    restart: unless-stopped
+
+networks:
+  mcp-network:
+    driver: bridge
