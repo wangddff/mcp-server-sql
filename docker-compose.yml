@@ -44,7 +44,7 @@ services:
     build: mcp/.
     container_name: mcp-server
     ports:
-      - "8080:8000"
+      - "8000:8000"
     environment:
       # 切换数据库：注释一个，取消注释另一个
       DATABASE_URL: "postgresql://demo_user:demo_pass@postgres-db:5432/demo_db"

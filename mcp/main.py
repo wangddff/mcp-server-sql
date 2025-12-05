@@ -1,121 +1,94 @@
-import re
 import logging
-import os
-from fastapi import FastAPI, HTTPException, Request, Depends
-from fastapi.security import HTTPBearer
-from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+import json
 import psycopg2
 import pymysql
+import urllib.parse
+from typing import Any, List, Dict
+from fastmcp import FastMCP
+from config import DATABASE_URL, DB_TYPE, ALLOWED_TABLES, FORBIDDEN_KEYWORDS
 
-from config import DATABASE_URL, DB_TYPE, ALLOWED_TABLES, ALLOWED_COLUMNS, FORBIDDEN_KEYWORDS
-
-app = FastAPI(title="MCP SQL Server", version="1.0")
-security = HTTPBearer(auto_error=False)
+# 初始化 FastMCP 服务
+# dependencies 列表可以用来注入依赖，这里我们简单起见直接使用
+mcp = FastMCP(
+    "SQL Server",
+    host="0.0.0.0",
+    port=8000
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-API_KEY = os.getenv("MCP_API_KEY")
-
-def verify_token(credentials = Depends(security)):
-    if API_KEY and (not credentials or credentials.credentials != API_KEY):
-        raise HTTPException(status_code=403, detail="Invalid or missing API key")
-
-# ======================
-# MCP /manifest 端点（Dify 1.10.1 必需）
-# ======================
-@app.get("/manifest")
-async def get_manifest():
-    return {
-        "name": "sql_database_query",
-        "description": "Securely query PostgreSQL or MySQL databases using natural language.",
-        "version": "1.0.0",
-        "tools": [
-            {
-                "name": "query_database",
-                "description": "Execute a SELECT SQL query against the allowed tables and return JSON results.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "A valid SELECT SQL statement (e.g., SELECT product_name, SUM(sale_amount) FROM sales GROUP BY product_name)"
-                        }
-                    },
-                    "required": ["sql"]
-                }
-            }
-        ]
-    }
-
-# ======================
-# 工具调用端点：POST /query_database
-# Dify 会直接 POST 到此路径（带 JSON body）
-# ======================
-class QueryParams(BaseModel):
-    sql: str
-
-@app.post("/query_database", dependencies=[Depends(verify_token) if API_KEY else Depends(lambda: None)])
-async def handle_query_database(params: QueryParams, req: Request):
-    client_ip = req.client.host
-    logger.info(f"[MCP] {client_ip} → tool=query_database")
-
-    sql = params.sql.strip()
-    if not sql:
-        raise HTTPException(status_code=400, detail="SQL cannot be empty")
-
-    # --- 安全校验 ---
-    sql_lower = sql.lower()
+def validate_sql(sql: str) -> None:
+    """验证 SQL 安全性 (保留原有逻辑)"""
+    sql_lower = sql.lower().strip()
     if not sql_lower.startswith("select"):
-        raise HTTPException(status_code=400, detail="Only SELECT queries allowed")
+        raise ValueError("Only SELECT queries allowed")
     
     for kw in FORBIDDEN_KEYWORDS:
         if kw in sql_lower:
-            raise HTTPException(status_code=400, detail=f"Forbidden keyword: {kw}")
+            raise ValueError(f"Forbidden keyword: {kw}")
     
+    # 简单的表名检查 (建议生产环境使用更严格的解析库)
+    import re
     from_match = re.search(r'\bfrom\s+([a-zA-Z_][a-zA-Z0-9_]*)', sql_lower)
     if from_match:
         table = from_match.group(1)
         if table not in ALLOWED_TABLES:
-            raise HTTPException(status_code=400, detail=f"Table '{table}' is not allowed")
+            raise ValueError(f"Table '{table}' not allowed")
 
-    # --- 执行查询 ---
+def get_connection():
+    """获取数据库连接"""
+    if DB_TYPE == "postgresql":
+        return psycopg2.connect(DATABASE_URL)
+    elif DB_TYPE == "mysql":
+        parsed = urllib.parse.urlparse(DATABASE_URL)
+        return pymysql.connect(
+            host=parsed.hostname,
+            port=parsed.port or 3306,
+            user=parsed.username,
+            password=parsed.password,
+            database=parsed.path[1:],
+            charset='utf8mb4'
+        )
+    else:
+        raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}")
+
+@mcp.tool()
+def query_database(sql: str) -> str:
+    """
+    Execute a read-only SQL query against the connected database.
+    
+    Args:
+        sql: The SQL SELECT statement to execute. 
+             Make sure to use correct syntax for the underlying database (PostgreSQL or MySQL).
+    """
+    logger.info(f"[MCP] Executing SQL: {sql}")
+    
     try:
-        if DB_TYPE == "postgresql":
-            conn = psycopg2.connect(DATABASE_URL)
-        elif DB_TYPE == "mysql":
-            import urllib.parse
-            parsed = urllib.parse.urlparse(DATABASE_URL)
-            conn = pymysql.connect(
-                host=parsed.hostname,
-                port=parsed.port or 3306,
-                user=parsed.username,
-                password=parsed.password,
-                database=parsed.path[1:],
-                charset='utf8mb4'
-            )
-        else:
-            raise ValueError("Unsupported DB_TYPE")
-
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            columns = [desc[0] for desc in cur.description]
-            rows = [dict(zip(columns, row)) for row in cur.fetchall()]
-        conn.close()
-
-        return {
-            "data": rows,
-            "count": len(rows)
-        }
-
+        validate_sql(sql)
+        
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                # 获取列名
+                if cur.description:
+                    columns = [desc[0] for desc in cur.description]
+                    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+                else:
+                    return "Query executed successfully but returned no results."
+                
+                # 返回 JSON 字符串，这对 LLM 来说最容易解析
+                return json.dumps(rows, ensure_ascii=False, default=str)
+        finally:
+            conn.close()
+            
     except Exception as e:
-        logger.error(f"Query error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database execution failed: {str(e)}")
+        logger.error(f"Query failed: {e}")
+        # 直接返回错误信息给 LLM，让它知道 SQL 哪里错了
+        return f"Error executing query: {str(e)}"
 
-# ======================
-# 健康检查
-# ======================
-@app.get("/health")
-def health():
-    return {"status": "ok", "db_type": DB_TYPE}
+# 启动入口
+# FastMCP 默认使用 SSE 传输模式，适合 Dify 通过 HTTP 调用
+if __name__ == "__main__":
+    mcp.run(transport="sse")
